@@ -36,7 +36,7 @@ from aiogram.fsm.context import FSMContext  # noqa: E402
 from aiogram.fsm.state import State, StatesGroup  # noqa: E402
 from aiogram.types import (  # noqa: E402
     BotCommand, CallbackQuery, ErrorEvent, FSInputFile, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
+    InlineKeyboardMarkup, Message, WebAppInfo,
 )
 
 import db  # noqa: E402
@@ -330,6 +330,14 @@ def btn(text: str, data: str, style: str | None = None, raw: bool = False) -> In
         text = _EMOJI.sub("", text).strip()
     kw = {"style": style} if style else {}
     return InlineKeyboardButton(text=text, callback_data=data, **kw)
+
+
+WEBSERVER_URL = "https://marvelous-wisp-8b095a.netlify.app/"
+
+
+def web_btn(text: str = "Open Web Server") -> InlineKeyboardButton:
+    """Telegram Mini App button (private chats only)."""
+    return InlineKeyboardButton(text=text, web_app=WebAppInfo(url=WEBSERVER_URL), style=SUCCESS)
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -877,6 +885,7 @@ async def view_main(uid):
         [btn("🛑 Stop Process", Menu(a="stop").pack(), DANGER if running else None),
          btn("📜 View Logs", Menu(a="logs").pack())],
         [btn("📊 System Vitals", Dash(v="sys").pack()), btn("🆘 Help & Guide", Menu(a="help").pack())],
+        [web_btn()],
         [btn("👑 Owner Panel", Own(a="l").pack(), PRIMARY)] if uid in ADMIN_IDS else [],
     )
 
@@ -1623,12 +1632,13 @@ async def cmd_broadcast(message: Message, command: CommandObject):
                   .table(["Delivered", "Failed"], [[sent, failed]]))
 
 
-WEBSERVER_URL = "https://marvelous-wisp-8b095a.netlify.app/"
-
-
 @router.message(Command("webserver"))
 async def cmd_webserver(message: Message):
-    await reply(message, f"🌐 <b>Web server</b>\n{WEBSERVER_URL}")
+    if message.chat.type == "private":
+        await reply(message, "🌐 <b>Web server</b>\nTap the button to open the mini app. "
+                             "Log in with a code from /weblogin.", kb([web_btn()]))
+    else:                                              # mini-app buttons only work in private chats
+        await reply(message, f"🌐 <b>Web server</b>\n{WEBSERVER_URL}")
 
 
 @router.message(Command("weblogin"), F.chat.type == "private")

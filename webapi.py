@@ -32,6 +32,10 @@ V = None                                   # the vps module (set by start())
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
 SESSION_TTL = 12 * 3600
+# Origins allowed to call the API from a browser (the static page is hosted on Netlify, the API on Railway).
+# Override with the WEB_ORIGIN env var (comma separated).
+ALLOWED_ORIGINS = {o.strip().rstrip("/") for o in os.environ.get(
+    "WEB_ORIGIN", "https://marvelous-wisp-8b095a.netlify.app").split(",") if o.strip()}
 MAX_UP = 200 * 1024 * 1024
 MAX_EDIT = 1024 * 1024
 SESS: dict[str, dict] = {}
@@ -127,6 +131,14 @@ async def sh(cmd: str, cwd: str, timeout: int = 60) -> tuple[int, str]:
 # ---------------------------------------------------------------- middleware
 @web.middleware
 async def guard(req: web.Request, handler):
+    origin = req.headers.get("Origin", "")
+    cors = {}
+    if origin.rstrip("/") in ALLOWED_ORIGINS:
+        cors = {"Access-Control-Allow-Origin": origin, "Vary": "Origin",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS", "Access-Control-Max-Age": "600"}
+    if req.method == "OPTIONS":
+        return web.Response(status=204, headers=cors)
     if req.path.startswith("/api/") and req.path != "/api/login":
         tok = req.headers.get("Authorization", "")[7:] or (req.query.get("t", "") if req.path == "/api/download" else "")
         s = SESS.get(tok)
@@ -138,6 +150,7 @@ async def guard(req: web.Request, handler):
         resp = await handler(req)
     except web.HTTPException as exc:
         resp = exc
+    resp.headers.update(cors)
     resp.headers.update({"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
                          "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
     if isinstance(resp, web.HTTPException):
