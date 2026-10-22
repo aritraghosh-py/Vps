@@ -471,10 +471,13 @@ def _signal_group(proc, sig) -> None:
 async def run_cmd(*args, cwd=None, timeout=900, env=None) -> tuple[int, str]:
     """Run a helper command with a hard timeout so nothing can hang the panel."""
     env = {**{k: v for k, v in os.environ.items() if k != "WEB_PASSWORD"}, **PIP_ENV, **(env or {})}
-    proc = await asyncio.create_subprocess_exec(
-        *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT, start_new_session=True,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT, start_new_session=True,
+        )
+    except (FileNotFoundError, PermissionError) as exc:       # e.g. git not installed on this host
+        return 127, f"cannot run '{args[0]}': {exc}"
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
@@ -1311,6 +1314,9 @@ async def on_error(event: ErrorEvent) -> bool:
     cb = event.update.callback_query
     if cb:
         await answer(cb, "⚠️ Something went wrong. Please try again.", True)
+    elif event.update.message:
+        with contextlib.suppress(Exception):
+            await reply(event.update.message, "⚠️ Something went wrong. Please try again.")
     return True
 
 
@@ -1695,24 +1701,34 @@ async def cmd_deleteproject(message: Message, command: CommandObject):
 
 @router.message(Command("clone"))
 async def cmd_clone(message: Message, command: CommandObject):
-    url = (command.args or "").split()[0].split("/tree/")[0] if command.args else ""
+    parts = (command.args or "").split()
+    url = parts[0].split("/tree/")[0].split("?")[0].split("#")[0].rstrip("/") if parts else ""
     if not re.fullmatch(r"https://[\w.\-]+/[\w.\-~%/]+", url):
         return await reply(message, "Usage: <code>/clone https://github.com/user/repo</code>")
-    name = re.sub(r"[^a-zA-Z0-9\-]", "-", url.rstrip("/").split("/")[-1].replace(".git", ""))[:40] or "repo"
+    name = url.split("/")[-1].removesuffix(".git")
+    name = re.sub(r"[^a-zA-Z0-9\-]", "-", name)[:40] or "repo"
     uid = message.from_user.id
     pdir = project_dir(uid, name)
     if os.path.exists(pdir):
         return await reply(message, f"⚠️ Project <code>{esc(name)}</code> exists!")
     msg = await reply(message, f"⏳ Cloning <code>{esc(name)}</code>…")
-    os.makedirs(user_dir(uid), exist_ok=True)
-    env = {**{k: v for k, v in os.environ.items() if k != "WEB_PASSWORD"}, "GIT_TERMINAL_PROMPT": "0"}      # private repo => fail fast instead of hanging
-    rc, out = await run_cmd("git", "clone", "--", url, pdir, timeout=600, env=env)
-    if rc != 0:
-        return await edit_msg(msg, f"❌ Failed.\n<pre>{esc(out[-600:])}</pre>")
-    await edit_msg(msg, "⏳ Creating virtual environment…")
-    await run_cmd(sys.executable, "-m", "venv", os.path.join(pdir, "venv"), timeout=300)
-    await db.aset_active_project(uid, name)
-    await edit_msg(msg, f"✅ Cloned <code>{esc(name)}</code>!")
+    try:
+        os.makedirs(user_dir(uid), exist_ok=True)
+        env = {"GIT_TERMINAL_PROMPT": "0"}                    # private repo => fail fast instead of hanging
+        rc, out = await run_cmd("git", "clone", "--depth", "1", "--", url, pdir, timeout=600, env=env)
+        if rc != 0:
+            await asyncio.to_thread(shutil.rmtree, pdir, True)  # don't leave a half-cloned dir ("exists!" on retry)
+            hint = "\nInstall git on the host (apt install git)." if rc == 127 else ""
+            return await edit_msg(msg, f"❌ Failed.{hint}\n<pre>{esc(out[-600:])}</pre>")
+        await edit_msg(msg, "⏳ Creating virtual environment…")
+        vrc, vout = await run_cmd(sys.executable, "-m", "venv", os.path.join(pdir, "venv"), timeout=300)
+        await db.aset_active_project(uid, name)
+        note = "" if vrc == 0 else f"\n⚠️ Repo cloned, but venv failed:\n<pre>{esc(vout[-300:])}</pre>"
+        await edit_msg(msg, f"✅ Cloned <code>{esc(name)}</code>!{note}")
+    except Exception as exc:                                  # never fail silently on "Cloning…"
+        log.exception("clone failed")
+        await asyncio.to_thread(shutil.rmtree, pdir, True)
+        await edit_msg(msg, f"❌ Clone error: <code>{esc(str(exc)[:300])}</code>")
 
 
 @router.message(Command("run"))
