@@ -61,6 +61,9 @@ STATE_FILE = "active_runs.json"
 MB = 1024 * 1024
 MAX_UPLOAD = (2000 if LOCAL_API else 50) * MB          # Bot API: 50 MB up
 MAX_DOWNLOAD = (2000 if LOCAL_API else 20) * MB        # Bot API: 20 MB down
+BACKUP_PART = max(1, min(MAX_UPLOAD, MAX_DOWNLOAD) - MB)   # backups bigger than this are split into parts (<20 MB each)
+BACKUP_MAGIC = "CRBK1"                                    # first line of the pinned manifest of a multi-part backup
+MANUAL_RESTORE = "restore_manual.zip"                     # drop a full backup zip here (scp) to restore without Telegram
 PAGE = 20
 HIDDEN = {"venv", "__pycache__", ".git"}
 KEEP_HIDDEN_EXT = (".session", ".session-journal", ".env")
@@ -790,36 +793,96 @@ def _build_backup_zip(path: str) -> None:
             os.remove(snap)
 
 
+def _split_file(path: str, part_size: int) -> list[str]:
+    parts = []
+    with open(path, "rb") as src:
+        i = 1
+        while True:
+            chunk = src.read(part_size)
+            if not chunk:
+                break
+            p = f"{path}.part{i:03d}"
+            with open(p, "wb") as out:
+                out.write(chunk)
+            parts.append(p)
+            i += 1
+    return parts
+
+
+def _parse_manifest(text: str | None) -> dict | None:
+    if not text or not text.startswith(BACKUP_MAGIC):
+        return None
+    try:
+        return json.loads(text[len(BACKUP_MAGIC):].strip())
+    except ValueError:
+        return None
+
+
+async def _send_part(path: str, caption: str):
+    for attempt in range(3):
+        try:
+            return await bot.send_document(BACKUP_CHANNEL_ID, FSInputFile(path, filename=os.path.basename(path)),
+                                           caption=caption, request_timeout=900)
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+    raise RuntimeError(f"could not upload {os.path.basename(path)} (flood limit)")
+
+
 async def perform_backup(status: Message | None = None) -> None:
     zip_path = "system_backup.zip"
+    parts: list[str] = []
     try:
         await asyncio.to_thread(_build_backup_zip, zip_path)
         size = os.path.getsize(zip_path)
-        if size > MAX_UPLOAD:
-            raise RuntimeError(f"backup is {format_size(size)} — over the {format_size(MAX_UPLOAD)} Bot API upload "
-                               "limit. Run a local Bot API server (LOCAL_BOT_API) or trim projects.")
-        old_id = None
+        old_ids: list[int] = []
         with contextlib.suppress(TelegramAPIError):
             chat = await bot.get_chat(BACKUP_CHANNEL_ID)
-            old_id = chat.pinned_message.message_id if chat.pinned_message else None
-        sent = await bot.send_document(
-            BACKUP_CHANNEL_ID, FSInputFile(zip_path, filename="system_backup.zip"),
-            caption=f"☁️ <b>Auto-Backup</b>\n📅 Last save: <code>{time.strftime('%Y-%m-%d %H:%M:%S')}</code>",
-        )
-        await bot.pin_chat_message(BACKUP_CHANNEL_ID, sent.message_id, disable_notification=True)
-        if old_id and old_id != sent.message_id:      # delete the old one only AFTER the new one is safe
-            with contextlib.suppress(TelegramAPIError):
-                await bot.delete_message(BACKUP_CHANNEL_ID, old_id)
+            pm = chat.pinned_message
+            if pm:
+                old_ids.append(pm.message_id)
+                man = _parse_manifest(pm.text)
+                if man:
+                    old_ids += [int(i) for i in man.get("msg_ids", [])]
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        new_ids: list[int] = []
+        if size <= BACKUP_PART:
+            sent = await _send_part(zip_path, f"☁️ <b>Auto-Backup</b>\n📅 Last save: <code>{stamp}</code>")
+            new_ids.append(sent.message_id)
+            pin_id = sent.message_id
+        else:
+            # Telegram bots can only DOWNLOAD 20 MB files, so a big backup is cut into <20 MB parts
+            # and a small pinned manifest remembers where every part is.
+            parts = await asyncio.to_thread(_split_file, zip_path, BACKUP_PART)
+            entries = []
+            for n, p in enumerate(parts, 1):
+                if status:
+                    with contextlib.suppress(TelegramAPIError):
+                        await ui.edit(bot, status, Rich().h(3, "☁️ Uploading backup").p(f"Part {n}/{len(parts)}…"))
+                sent = await _send_part(p, f"☁️ <b>Backup part {n}/{len(parts)}</b>\n📅 <code>{stamp}</code>")
+                new_ids.append(sent.message_id)
+                entries.append({"file_id": sent.document.file_id, "size": os.path.getsize(p)})
+            manifest = {"total": size, "date": stamp, "parts": entries, "msg_ids": list(new_ids)}
+            man_msg = await bot.send_message(
+                BACKUP_CHANNEL_ID, f"{BACKUP_MAGIC}\n{json.dumps(manifest)}", parse_mode=None)
+            new_ids.append(man_msg.message_id)
+            pin_id = man_msg.message_id
+        await bot.pin_chat_message(BACKUP_CHANNEL_ID, pin_id, disable_notification=True)
+        for oid in old_ids:                              # delete the old backup only AFTER the new one is safe
+            if oid not in new_ids:
+                with contextlib.suppress(TelegramAPIError):
+                    await bot.delete_message(BACKUP_CHANNEL_ID, oid)
         if status:
-            await ui.edit(bot, status, Rich().h(3, "✅ Backup saved").p(f"Pinned in the cloud channel · {format_size(size)}"))
+            extra = f" · {len(parts)} parts" if parts else ""
+            await ui.edit(bot, status, Rich().h(3, "✅ Backup saved").p(f"Pinned in the cloud channel · {format_size(size)}{extra}"))
     except Exception as exc:
         log.exception("backup failed")
         if status:
             with contextlib.suppress(TelegramAPIError):
                 await ui.edit(bot, status, Rich().h(3, "❌ Backup failed").pre(str(exc)))
     finally:
-        with contextlib.suppress(OSError):
-            os.remove(zip_path)
+        for p in [zip_path, *parts]:
+            with contextlib.suppress(OSError):
+                os.remove(p)
 
 
 async def auto_backup_loop() -> None:
@@ -831,26 +894,56 @@ async def auto_backup_loop() -> None:
             log.exception("auto-backup crashed")
 
 
+async def _download_backup(tmp: str, msg: Message | None) -> bool:
+    """Fetch the pinned backup into `tmp`. Returns False when there is nothing to restore."""
+    chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+    pm = chat.pinned_message
+    man = _parse_manifest(pm.text) if pm else None
+    if man:                                                   # multi-part backup: download and glue the parts
+        parts = man.get("parts", [])
+        with open(tmp, "wb") as out:
+            for n, part in enumerate(parts, 1):
+                if msg:
+                    await edit_msg(msg, f"📥 <b>Downloading backup…</b> part {n}/{len(parts)}")
+                piece = f"{tmp}.part"
+                await bot.download(part["file_id"], destination=piece)
+                with open(piece, "rb") as f:
+                    shutil.copyfileobj(f, out)
+                os.remove(piece)
+        if os.path.getsize(tmp) != man.get("total", os.path.getsize(tmp)):
+            raise RuntimeError("downloaded backup is incomplete (size mismatch).")
+        return True
+    doc = pm.document if pm else None
+    if not doc or doc.file_name != "system_backup.zip":
+        if msg:
+            await edit_msg(msg, "ℹ️ No backup pinned in the channel. Starting fresh.")
+        return False
+    if doc.file_size and doc.file_size > MAX_DOWNLOAD:
+        raise RuntimeError(
+            f"this older backup is {format_size(doc.file_size)} - over the {format_size(MAX_DOWNLOAD)} Bot API download limit.\n"
+            f"Download it from the channel yourself, copy it to the VPS as {MANUAL_RESTORE} next to this script "
+            "and restart the bot. The next backup will be saved in small parts automatically.")
+    if msg:
+        await edit_msg(msg, "📥 <b>Backup found! Restoring files, sessions and database…</b>")
+    await bot.download(doc, destination=tmp)
+    return True
+
+
 async def restore_system() -> None:
     fresh = not os.path.isdir(BASE_DIR) or not os.listdir(BASE_DIR)
-    if RESTORE_MODE == "never" or (RESTORE_MODE == "auto" and not fresh):
+    manual = os.path.isfile(MANUAL_RESTORE)
+    if RESTORE_MODE == "never" or (RESTORE_MODE == "auto" and not fresh and not manual):
         return
     admin = min(ADMIN_IDS) if ADMIN_IDS else None
     msg = await say(admin, "☁️ <b>Checking pinned backup…</b>") if admin else None
+    tmp = "restore_tmp.zip"
     try:
-        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
-        doc = chat.pinned_message.document if chat.pinned_message else None
-        if not doc or doc.file_name != "system_backup.zip":
+        if manual:                                            # a zip placed on the VPS by hand wins over Telegram
+            tmp = MANUAL_RESTORE
             if msg:
-                await edit_msg(msg, "ℹ️ No backup pinned in the channel. Starting fresh.")
+                await edit_msg(msg, "📥 <b>Manual backup found! Restoring files, sessions and database…</b>")
+        elif not await _download_backup(tmp, msg):
             return
-        if doc.file_size and doc.file_size > MAX_DOWNLOAD:
-            raise RuntimeError(f"backup is {format_size(doc.file_size)} — over the {format_size(MAX_DOWNLOAD)} "
-                               "Bot API download limit (use LOCAL_BOT_API).")
-        if msg:
-            await edit_msg(msg, "📥 <b>Backup found! Restoring files, sessions and database…</b>")
-        tmp = "restore_tmp.zip"
-        await bot.download(doc, destination=tmp)
         db.release()
         for ext in ("-wal", "-shm"):
             with contextlib.suppress(OSError):
@@ -862,6 +955,9 @@ async def restore_system() -> None:
             await edit_msg(msg, "✅ <b>Restore complete!</b> Projects, sessions and DB recovered.")
     except Exception as exc:
         log.exception("restore failed")
+        with contextlib.suppress(OSError):
+            if tmp != MANUAL_RESTORE:
+                os.remove(tmp)
         if msg:
             with contextlib.suppress(TelegramAPIError):
                 await edit_msg(msg, f"⚠️ <b>Restore failed:</b>\n<pre>{esc(exc)}</pre>")
@@ -2363,7 +2459,7 @@ def _pyc_dirs(root_dir: str) -> list[str]:
 
 
 def _tmp_files() -> list[str]:
-    out = [f for f in ("system_backup.zip", "restore_tmp.zip", "runner_panel.db.snapshot") if os.path.isfile(f)]
+    out = [f for f in ("system_backup.zip", "restore_tmp.zip", "restore_tmp.zip.part", "runner_panel.db.snapshot") if os.path.isfile(f)]
     for uid in _all_user_ids():
         ud = user_dir(uid)
         with contextlib.suppress(OSError):
